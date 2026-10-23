@@ -100,6 +100,10 @@ const REPAIR_PING_CACHE_OUTSTANDING_PING_TIMEOUT_MS: Range<u64> = 1000..2000;
 pub(crate) const REPAIR_RESPONSE_SERIALIZED_PING_BYTES: usize =
     4 /*enum discriminator*/ + PUBKEY_BYTES + REPAIR_PING_TOKEN_SIZE + SIGNATURE_BYTES;
 const SIGNED_REPAIR_TIME_WINDOW: Duration = Duration::from_secs(60 * 10); // 10 min
+/// How long after an identity change we keep serving requests addressed to our previous
+/// identity. Requesters keep addressing the pubkey they picked (repair peers cache,
+/// `--repair-validators`) until gossip carries the change.
+const OLD_IDENTITY_GRACE: Duration = Duration::from_secs(60);
 
 #[cfg(test)]
 static_assertions::const_assert_eq!(MAX_ANCESTOR_RESPONSES, 30);
@@ -787,6 +791,10 @@ pub struct ServeRepair {
     repair_handler: Box<dyn RepairHandler + Send + Sync>,
     leader_state: Option<SharedLeaderState>,
     migration_status: Arc<MigrationStatus>,
+    /// Our identity as of the last served batch of requests.
+    identity: Pubkey,
+    /// The identity before `identity`, and when it was replaced.
+    old_identity: Option<(Pubkey, Instant)>,
 }
 
 // Cache entry for repair peers for a slot.
@@ -867,12 +875,14 @@ impl ServeRepair {
         migration_status: Arc<MigrationStatus>,
     ) -> Self {
         Self {
+            identity: cluster_info.id(),
             cluster_info,
             sharable_banks,
             repair_whitelist,
             repair_handler,
             leader_state: None,
             migration_status,
+            old_identity: None,
         }
     }
 
@@ -885,12 +895,14 @@ impl ServeRepair {
         migration_status: Arc<MigrationStatus>,
     ) -> Self {
         Self {
+            identity: cluster_info.id(),
             cluster_info,
             sharable_banks,
             repair_whitelist,
             repair_handler,
             leader_state: Some(leader_state),
             migration_status,
+            old_identity: None,
         }
     }
 
@@ -1172,6 +1184,7 @@ impl ServeRepair {
         epoch_staked_nodes: &Option<Arc<HashMap<Pubkey, u64>>>,
         whitelist: &HashSet<Pubkey>,
         my_id: &Pubkey,
+        old_id: Option<&Pubkey>,
         socket_addr_space: &SocketAddrSpace,
         ping_cache: &mut PingCache,
         remaining_pong_budget: &mut usize,
@@ -1195,7 +1208,7 @@ impl ServeRepair {
                 }
                 ping_cache.add(pong, from_addr, Instant::now());
             }
-            _ => Self::verify_signed_packet(my_id, remote_request.buffer(), &request)?,
+            _ => Self::verify_signed_packet(my_id, old_id, remote_request.buffer(), &request)?,
         }
         if request.sender() == Some(my_id) {
             error!("self repair: from_addr={from_addr} my_id={my_id} request={request:?}");
@@ -1256,6 +1269,7 @@ impl ServeRepair {
         epoch_staked_nodes: &Option<Arc<HashMap<Pubkey, u64>>>,
         whitelist: &HashSet<Pubkey>,
         my_id: &Pubkey,
+        old_id: Option<&Pubkey>,
         socket_addr_space: &SocketAddrSpace,
         mut remaining_budget_estimate: usize,
         ping_cache: &mut PingCache,
@@ -1281,6 +1295,7 @@ impl ServeRepair {
                 epoch_staked_nodes,
                 whitelist,
                 my_id,
+                old_id,
                 socket_addr_space,
                 ping_cache,
                 &mut remaining_pong_budget,
@@ -1328,6 +1343,7 @@ impl ServeRepair {
         let epoch_staked_nodes = root_bank.epoch_staked_nodes(root_bank.epoch());
         let identity_keypair = self.cluster_info.keypair();
         let my_id = identity_keypair.pubkey();
+        let old_id = self.old_identity(my_id, Instant::now());
 
         let target_max_buffered_packets = if !self.repair_whitelist.read().unwrap().is_empty() {
             4 * MAX_REQUESTS_PER_ITERATION
@@ -1388,6 +1404,7 @@ impl ServeRepair {
                 &epoch_staked_nodes,
                 &whitelist,
                 &my_id,
+                old_id.as_ref(),
                 &socket_addr_space,
                 effective_data_budget_estimate,
                 ping_cache,
@@ -1581,7 +1598,24 @@ impl ServeRepair {
             .unwrap()
     }
 
-    fn verify_signed_packet(my_id: &Pubkey, bytes: &[u8], request: &RepairProtocol) -> Result<()> {
+    /// Records an identity change and returns our previous identity while requests addressed
+    /// to it are still served.
+    fn old_identity(&mut self, my_id: Pubkey, now: Instant) -> Option<Pubkey> {
+        let previous_identity = std::mem::replace(&mut self.identity, my_id);
+        if previous_identity != my_id {
+            self.old_identity = Some((previous_identity, now));
+        }
+        self.old_identity
+            .filter(|(_, since)| now.duration_since(*since) < OLD_IDENTITY_GRACE)
+            .map(|(old_id, _)| old_id)
+    }
+
+    fn verify_signed_packet(
+        my_id: &Pubkey,
+        old_id: Option<&Pubkey>,
+        bytes: &[u8],
+        request: &RepairProtocol,
+    ) -> Result<()> {
         match request {
             RepairProtocol::LegacyWindowIndex
             | RepairProtocol::LegacyHighestWindowIndex
@@ -1606,7 +1640,7 @@ impl ServeRepair {
             | RepairProtocol::ParentAndFecSetCount { header, .. }
             | RepairProtocol::FecSetRoot { header, .. }
             | RepairProtocol::WindowIndexForBlockId { header, .. } => {
-                if &header.recipient != my_id {
+                if &header.recipient != my_id && Some(&header.recipient) != old_id {
                     return Err(Error::from(RepairVerifyError::IdMismatch));
                 }
                 let time_diff_ms = timestamp().abs_diff(header.timestamp);
@@ -2553,6 +2587,7 @@ mod tests {
         assert_matches!(
             ServeRepair::verify_signed_packet(
                 &other_keypair.pubkey(),
+                None,
                 packet.data(..).unwrap(),
                 &request
             ),
@@ -2577,6 +2612,7 @@ mod tests {
         assert_matches!(
             ServeRepair::verify_signed_packet(
                 &my_keypair.pubkey(),
+                None,
                 packet.data(..).unwrap(),
                 &request
             ),
@@ -2603,6 +2639,7 @@ mod tests {
         assert_matches!(
             ServeRepair::verify_signed_packet(
                 &other_keypair.pubkey(),
+                None,
                 packet.data(..).unwrap(),
                 &request
             ),
@@ -2627,6 +2664,7 @@ mod tests {
         assert_matches!(
             ServeRepair::verify_signed_packet(
                 &other_keypair.pubkey(),
+                None,
                 packet.data(..).unwrap(),
                 &request
             ),
@@ -3616,6 +3654,7 @@ mod tests {
             &None,
             &HashSet::default(),
             &identity_keypair.pubkey(),
+            None,
             &SocketAddrSpace::Unspecified,
             usize::MAX,
             &mut ping_cache,
@@ -3626,6 +3665,61 @@ mod tests {
         assert_eq!(
             stats.err_sig_verify, 0,
             "challenge matching must reject the pong before sigverify"
+        );
+    }
+
+    #[test]
+    fn test_old_identity_served_after_identity_change() {
+        let old_keypair = Arc::new(Keypair::new());
+        let new_keypair = Arc::new(Keypair::new());
+        let remote_keypair = Keypair::new();
+        let from_addr = socketaddr!(Ipv4Addr::LOCALHOST, 1234);
+        let contact_info = ContactInfo::new_localhost(&old_keypair.pubkey(), timestamp());
+        let cluster_info = Arc::new(ClusterInfo::new(
+            contact_info,
+            old_keypair.clone(),
+            SocketAddrSpace::Unspecified,
+        ));
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank_forks = BankForks::new_rw_arc(Bank::new_for_tests(&genesis_config));
+        let mut serve_repair = ServeRepair::new_for_test(
+            cluster_info.clone(),
+            bank_forks,
+            Arc::new(RwLock::new(HashSet::default())),
+        );
+        let mut ping_cache = ping_cache_for_tests();
+
+        // The requester still addresses our old identity after we switch.
+        let start = Instant::now();
+        assert_eq!(serve_repair.old_identity(old_keypair.pubkey(), start), None);
+        cluster_info.set_keypair(new_keypair.clone());
+        let mut decode = |now| {
+            let old_id = serve_repair.old_identity(cluster_info.id(), now);
+            let packet = signed_window_index_packet(&old_keypair, &remote_keypair, &from_addr);
+            let mut stats = ServeRepairStats::default();
+            let decoded = ServeRepair::decode_requests(
+                vec![packet],
+                &None,
+                &HashSet::default(),
+                &cluster_info.id(),
+                old_id.as_ref(),
+                &SocketAddrSpace::Unspecified,
+                usize::MAX,
+                &mut ping_cache,
+                &mut stats,
+            );
+            (decoded.len(), stats.err_id_mismatch)
+        };
+        assert_eq!(decode(start), (1, 0));
+        assert_eq!(decode(start + OLD_IDENTITY_GRACE / 2), (1, 0));
+        assert_eq!(decode(start + OLD_IDENTITY_GRACE), (0, 1));
+
+        // Switching back makes the identity we leave the old one.
+        cluster_info.set_keypair(old_keypair.clone());
+        let later = start + 2 * OLD_IDENTITY_GRACE;
+        assert_eq!(
+            serve_repair.old_identity(old_keypair.pubkey(), later),
+            Some(new_keypair.pubkey())
         );
     }
 
@@ -3653,6 +3747,7 @@ mod tests {
                 &None,
                 &HashSet::default(),
                 &identity_keypair.pubkey(),
+                None,
                 &SocketAddrSpace::Unspecified,
                 usize::MAX,
                 ping_cache,
@@ -3714,6 +3809,7 @@ mod tests {
             &None,
             &HashSet::default(),
             &identity_keypair.pubkey(),
+            None,
             &SocketAddrSpace::Unspecified,
             usize::MAX,
             &mut ping_cache,
@@ -3761,6 +3857,7 @@ mod tests {
             &None,
             &HashSet::default(),
             &identity_keypair.pubkey(),
+            None,
             &SocketAddrSpace::Unspecified,
             usize::MAX,
             &mut ping_cache,
@@ -3802,6 +3899,7 @@ mod tests {
             &None,
             &HashSet::default(),
             &identity_keypair.pubkey(),
+            None,
             &SocketAddrSpace::Unspecified,
             MIN_RESPONSE_SIZE,
             &mut ping_cache,
