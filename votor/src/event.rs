@@ -73,8 +73,10 @@ pub enum VotorEvent {
     /// The slot is the highest finalized slot
     Standstill(Slot),
 
-    /// The identity keypair has changed due to an operator calling set-identity
-    SetIdentity,
+    /// The identity keypair has changed due to an operator calling set-identity.
+    /// `switched` is signaled once votor votes with the new identity, after every
+    /// vote signed by the old identity has been saved to its vote history.
+    SetIdentity { switched: Sender<()> },
 }
 
 impl VotorEvent {
@@ -111,7 +113,7 @@ impl VotorEvent {
             } => s <= &root,
             VotorEvent::Standstill(s) => s < &root,
             VotorEvent::ProduceWindow(info) => info.start_slot <= root,
-            VotorEvent::SetIdentity => false,
+            VotorEvent::SetIdentity { .. } => false,
         }
     }
 }

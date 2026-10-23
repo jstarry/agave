@@ -3,7 +3,7 @@ use {
     agave_votor::{
         event::VotorEvent, vote_history::VoteHistory, vote_history_storage::VoteHistoryStorage,
     },
-    crossbeam_channel::Sender,
+    crossbeam_channel::{Sender, bounded},
     jsonrpc_core::{BoxFuture, ErrorCode, MetaIoHandler, Metadata, Result},
     jsonrpc_core_client::{RpcError, transports::ipc},
     jsonrpc_derive::rpc,
@@ -50,6 +50,9 @@ use {
     },
     tokio::runtime::Runtime,
 };
+
+/// How long set-identity waits for votor to stop voting with the old identity.
+const SET_IDENTITY_VOTOR_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct AdminRpcRequestMetadata {
@@ -1060,14 +1063,39 @@ impl AdminRpcImpl {
             post_init
                 .cluster_info
                 .set_keypair(Arc::new(identity_keypair));
+            let (switched_sender, switched_receiver) = bounded(1);
             post_init
                 .votor_event_sender
-                .send(VotorEvent::SetIdentity)
+                .send(VotorEvent::SetIdentity {
+                    switched: switched_sender,
+                })
                 .map_err(|err| jsonrpc_core::error::Error {
                     code: ErrorCode::InternalError,
                     message: format!("Failed to send SetIdentity event: {err}").to_string(),
                     data: None,
                 })?;
+
+            // Until votor handles the event it keeps voting with the old identity.
+            // Wait for it, so that once this returns the old identity's vote history
+            // is final and can be copied to the node taking it over.
+            let alpenglow_enabled = post_init
+                .bank_forks
+                .read()
+                .unwrap()
+                .migration_status()
+                .is_alpenglow_enabled();
+            if alpenglow_enabled {
+                switched_receiver
+                    .recv_timeout(SET_IDENTITY_VOTOR_TIMEOUT)
+                    .map_err(|err| jsonrpc_core::error::Error {
+                        code: ErrorCode::InternalError,
+                        message: format!(
+                            "Identity set to {new_identity}, but votor did not switch from \
+                             {old_identity}: {err}. Votes may still be cast with the old identity."
+                        ),
+                        data: None,
+                    })?;
+            }
 
             warn!("Identity set to {new_identity}");
             Ok(())
@@ -1350,6 +1378,15 @@ mod tests {
         });
 
         let RpcHandler { io, meta, .. } = rpc;
+        let votor = thread::spawn(move || {
+            let event = votor_event_receiver
+                .recv()
+                .expect("Failed to receive SetIdentity event");
+            let VotorEvent::SetIdentity { switched } = event else {
+                panic!("expected SetIdentity, got {event:?}");
+            };
+            switched.send(()).unwrap();
+        });
 
         let expected_validator_id = Keypair::new();
         let validator_id_bytes = format!("{:?}", expected_validator_id.to_bytes());
@@ -1384,10 +1421,50 @@ mod tests {
             actual_validator_id,
             expected_validator_id.pubkey().to_string()
         );
-        let event = votor_event_receiver
-            .recv()
-            .expect("Failed to receive SetIdentity event");
-        assert_matches!(event, VotorEvent::SetIdentity);
+        votor.join().unwrap();
+    }
+
+    #[test]
+    fn test_set_identity_waits_for_votor() {
+        let (votor_event_sender, votor_event_receiver) = bounded(1024);
+        let rpc = RpcHandler::start_with_config(TestConfig {
+            account_indexes: AccountSecondaryIndexes::default(),
+            votor_event_sender: Some(votor_event_sender),
+        });
+        let RpcHandler { io, meta, .. } = rpc;
+        meta.with_post_init(|post_init| {
+            let bank_forks = post_init.bank_forks.read().unwrap();
+            assert!(bank_forks.migration_status().is_alpenglow_enabled());
+            Ok(())
+        })
+        .unwrap();
+
+        // Votor handles the event only after a delay, as if it were busy.
+        let switched = Arc::new(AtomicBool::new(false));
+        let votor = thread::spawn({
+            let switched = switched.clone();
+            move || {
+                let VotorEvent::SetIdentity { switched: sender } = votor_event_receiver
+                    .recv()
+                    .expect("Failed to receive SetIdentity event")
+                else {
+                    panic!("expected SetIdentity");
+                };
+                thread::sleep(Duration::from_millis(200));
+                switched.store(true, Ordering::Relaxed);
+                sender.send(()).unwrap();
+            }
+        });
+
+        let validator_id_bytes = format!("{:?}", Keypair::new().to_bytes());
+        let set_id_request = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"setIdentityFromBytes","params":[{validator_id_bytes}, false, false]}}"#,
+        );
+        let response = io.handle_request_sync(&set_id_request, meta);
+        let response: Value = serde_json::from_str(&response.unwrap()).unwrap();
+        assert_eq!(response["result"], Value::Null, "{response}");
+        assert!(switched.load(Ordering::Relaxed));
+        votor.join().unwrap();
     }
 
     #[test]

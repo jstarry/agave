@@ -145,7 +145,7 @@ impl StatsEvent {
             VotorEvent::ProduceWindow(_) => StatsEvent::ProduceWindow,
             VotorEvent::Finalized(..) => StatsEvent::Finalized,
             VotorEvent::Standstill(_) => StatsEvent::Standstill,
-            VotorEvent::SetIdentity => StatsEvent::SetIdentity,
+            VotorEvent::SetIdentity { .. } => StatsEvent::SetIdentity,
         }
     }
 }

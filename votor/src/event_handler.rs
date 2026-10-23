@@ -570,7 +570,7 @@ impl EventHandler {
             }
 
             // Operator called set identity make sure that our keypair is updated for voting
-            VotorEvent::SetIdentity => {
+            VotorEvent::SetIdentity { switched } => {
                 info!("{}: SetIdentity", local_context.my_pubkey);
                 if let Err(e) = Self::handle_set_identity(ctx, vctx, local_context) {
                     error!(
@@ -582,6 +582,9 @@ impl EventHandler {
                     );
                     return Err(EventLoopError::SetIdentityError(e));
                 }
+                // Votes are saved before they are sent, so nothing signed by the old
+                // identity is still in flight. The operator may have given up waiting.
+                let _ = switched.send(());
                 Self::send_vote_history_to_consensus_pool(&local_context.my_pubkey, vctx)?;
             }
         }
@@ -1442,8 +1445,9 @@ mod tests {
         }
 
         fn send_set_identity_event(&mut self) {
+            let (switched, switched_receiver) = bounded(1);
             let mut new_ops = EventHandler::handle_event(
-                VotorEvent::SetIdentity,
+                VotorEvent::SetIdentity { switched },
                 &self.timer_manager,
                 &self.shared_context,
                 &mut self.voting_context,
@@ -1451,6 +1455,7 @@ mod tests {
                 &mut self.local_context,
             )
             .unwrap();
+            assert_eq!(switched_receiver.try_recv(), Ok(()));
             self.bls_ops.append(&mut new_ops);
         }
 
