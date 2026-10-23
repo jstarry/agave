@@ -527,13 +527,15 @@ impl<T: 'static> ClusterNodesCache<T> {
     ) -> Arc<ClusterNodes<T>> {
         // Returns the cached entry for the epoch if it is either uninitialized
         // or not expired yet. Discards the entry if it is already initialized
-        // but also expired.
+        // but also expired, or if it was built for a different identity.
+        let my_pubkey = cluster_info.id();
         let get_epoch_entry = |cache: &LruCache<Epoch, _>, epoch, ttl| {
             let entry: &Arc<OnceLock<(Instant, _)>> = cache.get(&epoch)?;
-            let Some((asof, _)) = entry.get() else {
+            let Some((asof, nodes)) = entry.get() else {
                 return Some(entry.clone()); // not initialized yet
             };
-            (asof.elapsed() < ttl).then(|| entry.clone())
+            let nodes: &Arc<ClusterNodes<T>> = nodes;
+            (asof.elapsed() < ttl && nodes.pubkey == my_pubkey).then(|| entry.clone())
         };
         let epoch_schedule = root_bank.epoch_schedule();
         let epoch = epoch_schedule.get_epoch(shred_slot);
@@ -676,6 +678,7 @@ mod tests {
         rand::prelude::IndexedRandom as _,
         solana_hash::Hash as SolanaHash,
         solana_ledger::shred::{ProcessShredsStats, Shredder},
+        solana_runtime::genesis_utils::create_genesis_config,
         std::{collections::VecDeque, fmt::Debug, hash::Hash},
         test_case::test_case,
     };
@@ -764,6 +767,26 @@ mod tests {
         // Convert cluster_nodes into hashset of pubkeys
         let all_nodes: HashSet<_> = cluster_nodes.nodes.iter().map(|n| *n.pubkey()).collect();
         assert_eq!(all_nodes, covered, "All nodes must be covered");
+    }
+
+    #[test]
+    fn test_cluster_nodes_cache_follows_identity_change() {
+        let mut rng = rand::rng();
+        let (_nodes, _stakes, cluster_info) = make_test_cluster(&mut rng, 20, None);
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank = Bank::new_for_tests(&genesis_config);
+        let cache = ClusterNodesCache::<BroadcastStage>::new(8, Duration::from_secs(3600));
+
+        let old_pubkey = cluster_info.id();
+        let nodes = cache.get(0, &bank, &bank, &cluster_info);
+        assert_eq!(nodes.pubkey, old_pubkey);
+
+        // After set-identity, the entry built for the old identity must not be
+        // reused even though it has not expired yet.
+        cluster_info.set_keypair(Arc::new(Keypair::new()));
+        let nodes = cache.get(0, &bank, &bank, &cluster_info);
+        assert_eq!(nodes.pubkey, cluster_info.id());
+        assert_ne!(nodes.pubkey, old_pubkey);
     }
 
     #[test]
