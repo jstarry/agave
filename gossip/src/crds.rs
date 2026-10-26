@@ -28,7 +28,7 @@
 use {
     crate::{
         cluster_info_metrics::{last_four_chars, should_report_message_signature},
-        contact_info::ContactInfo,
+        contact_info::{ContactInfo, Protocol},
         contact_info_notifier::{ContactInfoEvent, ContactInfoSender, ContactInfoSnapshot},
         crds_data::CrdsData,
         crds_entry::CrdsEntry,
@@ -50,7 +50,10 @@ use {
         collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map},
         debug_assert_matches,
         ops::{Bound, Index, IndexMut, Range},
-        sync::Mutex,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering as AtomicOrdering},
+        },
     },
 };
 
@@ -72,6 +75,9 @@ pub struct Crds {
     shards: CrdsShards,
     nodes: IndexSet<usize>, // Indices of nodes' ContactInfo.
     num_nodes_removed: u64,
+    // Number of times a node's contact-info was replaced with one having a
+    // different TVU address. Shared so turbine can read it without the lock.
+    num_tvu_addr_changes: Arc<AtomicU64>,
     // Indices of DuplicateShred keyed by insert order.
     duplicate_shreds: BTreeMap<u64 /*insert order*/, usize /*index*/>,
     // Indices of all crds values associated with a node.
@@ -253,6 +259,7 @@ impl Default for Crds {
             shards: CrdsShards::new(CRDS_SHARDS_BITS),
             nodes: IndexSet::default(),
             num_nodes_removed: 0,
+            num_tvu_addr_changes: Arc::default(),
             duplicate_shreds: BTreeMap::default(),
             records: HashMap::default(),
             entries: BTreeMap::default(),
@@ -331,6 +338,12 @@ impl Crds {
         self.contact_info_sender = Some(sender);
     }
 
+    /// Returns the counter of contact-info updates which changed a node's
+    /// TVU address.
+    pub(crate) fn num_tvu_addr_changes(&self) -> &Arc<AtomicU64> {
+        &self.num_tvu_addr_changes
+    }
+
     pub fn insert(
         &mut self,
         value: CrdsValue,
@@ -375,6 +388,12 @@ impl Crds {
                         // self.nodes does not need to be updated since the
                         // entry at this index was and stays contact-info.
                         debug_assert_matches!(entry.get().value.data(), CrdsData::ContactInfo(_));
+                        if let CrdsData::ContactInfo(old) = entry.get().value.data()
+                            && old.tvu(Protocol::UDP) != node.tvu(Protocol::UDP)
+                        {
+                            self.num_tvu_addr_changes
+                                .fetch_add(1, AtomicOrdering::Relaxed);
+                        }
                         emit_contact_info_event(
                             self.contact_info_sender.as_ref(),
                             ContactInfoEvent::Updated(ContactInfoSnapshot::from(node)),
@@ -942,6 +961,38 @@ mod tests {
 
         // No further events.
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_num_tvu_addr_changes() {
+        let mut crds = Crds::default();
+        let num_tvu_addr_changes = crds.num_tvu_addr_changes().clone();
+        let pubkey = Pubkey::new_unique();
+        let mut node = ContactInfo::new_localhost(&pubkey, /*wallclock:*/ 0);
+        let insert = |crds: &mut Crds, node: &ContactInfo| {
+            let value = CrdsValue::new_unsigned(CrdsData::from(node.clone()));
+            assert_matches!(crds.insert(value, 0, GossipRoute::LocalMessage), Ok(()));
+            num_tvu_addr_changes.load(AtomicOrdering::Relaxed)
+        };
+        // A new node is not an address change.
+        assert_eq!(insert(&mut crds, &node), 0);
+        // Neither is an update which keeps the TVU address.
+        node.set_wallclock(1);
+        node.set_gossip(([127, 0, 0, 1], 9000)).unwrap();
+        assert_eq!(insert(&mut crds, &node), 0);
+        // The node moves to a new TVU address.
+        node.set_wallclock(2);
+        node.set_tvu(Protocol::UDP, ([10, 0, 0, 1], 8001)).unwrap();
+        assert_eq!(insert(&mut crds, &node), 1);
+        // A rejected (outdated) update changes nothing.
+        node.set_wallclock(1);
+        node.set_tvu(Protocol::UDP, ([10, 0, 0, 2], 8001)).unwrap();
+        let value = CrdsValue::new_unsigned(CrdsData::from(node.clone()));
+        assert_matches!(
+            crds.insert(value, 0, GossipRoute::LocalMessage),
+            Err(CrdsError::InsertFailed)
+        );
+        assert_eq!(num_tvu_addr_changes.load(AtomicOrdering::Relaxed), 1);
     }
 
     #[test]

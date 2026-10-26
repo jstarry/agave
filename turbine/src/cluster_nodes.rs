@@ -92,9 +92,22 @@ pub struct ClusterNodes<T> {
 // on the entire cache.
 type LruCacheOnce<K, V> = RwLock<LruCache<K, Arc<OnceLock<V>>>>;
 
+// Anyone can change the TVU address of an unstaked node in gossip, so cap how
+// often address changes may force a rebuild.
+const MIN_REBUILD_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct ClusterNodesCache<T> {
-    cache: LruCacheOnce<Epoch, (/*as of:*/ Instant, Arc<ClusterNodes<T>>)>,
+    cache: LruCacheOnce<
+        Epoch,
+        (
+            /*as of:*/ Instant,
+            /*num_tvu_addr_changes:*/ u64,
+            Arc<ClusterNodes<T>>,
+        ),
+    >,
     ttl: Duration, // Time to live.
+    // Minimum age of an entry before a TVU address change discards it.
+    min_rebuild_interval: Duration,
 }
 
 impl Node {
@@ -513,6 +526,7 @@ impl<T> ClusterNodesCache<T> {
         Self {
             cache: RwLock::new(LruCache::new(cap)),
             ttl,
+            min_rebuild_interval: MIN_REBUILD_INTERVAL,
         }
     }
 }
@@ -525,15 +539,22 @@ impl<T: 'static> ClusterNodesCache<T> {
         working_bank: &Bank,
         cluster_info: &ClusterInfo,
     ) -> Arc<ClusterNodes<T>> {
+        // Read before building the entry, so that a TVU address change
+        // racing with the build triggers another rebuild.
+        let num_tvu_addr_changes = cluster_info.num_tvu_addr_changes();
         // Returns the cached entry for the epoch if it is either uninitialized
         // or not expired yet. Discards the entry if it is already initialized
-        // but also expired.
+        // but also expired, or if a node's TVU address has changed since.
         let get_epoch_entry = |cache: &LruCache<Epoch, _>, epoch, ttl| {
-            let entry: &Arc<OnceLock<(Instant, _)>> = cache.get(&epoch)?;
-            let Some((asof, _)) = entry.get() else {
+            let entry: &Arc<OnceLock<(Instant, u64, _)>> = cache.get(&epoch)?;
+            let Some((asof, entry_tvu_addr_changes, _)) = entry.get() else {
                 return Some(entry.clone()); // not initialized yet
             };
-            (asof.elapsed() < ttl).then(|| entry.clone())
+            let age = asof.elapsed();
+            // Another thread may have built the entry after a newer change.
+            let tvu_addr_changed = *entry_tvu_addr_changes < num_tvu_addr_changes;
+            (age < ttl && !(tvu_addr_changed && age >= self.min_rebuild_interval))
+                .then(|| entry.clone())
         };
         let epoch_schedule = root_bank.epoch_schedule();
         let epoch = epoch_schedule.get_epoch(shred_slot);
@@ -555,7 +576,7 @@ impl<T: 'static> ClusterNodesCache<T> {
             })
         });
         // Initialize if needed by only a single thread outside locks.
-        let (_, nodes) = entry.get_or_init(|| {
+        let (_, _, nodes) = entry.get_or_init(|| {
             let epoch_staked_nodes = [root_bank, working_bank]
                 .iter()
                 .find_map(|bank| bank.epoch_staked_nodes(epoch))
@@ -569,7 +590,7 @@ impl<T: 'static> ClusterNodesCache<T> {
                 });
             let nodes =
                 new_cluster_nodes::<T>(cluster_info, root_bank.cluster_type(), &epoch_staked_nodes);
-            (Instant::now(), Arc::new(nodes))
+            (Instant::now(), num_tvu_addr_changes, Arc::new(nodes))
         });
         nodes.clone()
     }
@@ -676,6 +697,7 @@ mod tests {
         rand::prelude::IndexedRandom as _,
         solana_hash::Hash as SolanaHash,
         solana_ledger::shred::{ProcessShredsStats, Shredder},
+        solana_runtime::genesis_utils::create_genesis_config,
         std::{assert_matches, collections::VecDeque, fmt::Debug, hash::Hash},
         test_case::test_case,
     };
@@ -764,6 +786,45 @@ mod tests {
         // Convert cluster_nodes into hashset of pubkeys
         let all_nodes: HashSet<_> = cluster_nodes.nodes.iter().map(|n| *n.pubkey()).collect();
         assert_eq!(all_nodes, covered, "All nodes must be covered");
+    }
+
+    #[test]
+    fn test_cluster_nodes_cache_follows_tvu_addr_change() {
+        let mut rng = rand::rng();
+        let (nodes, _stakes, cluster_info) = make_test_cluster(&mut rng, 20, None);
+        let genesis_config = create_genesis_config(10_000).genesis_config;
+        let bank = Bank::new_for_tests(&genesis_config);
+        let mut cache = ClusterNodesCache::<RetransmitStage>::new(8, Duration::from_secs(3600));
+        let tvu_addr = |cluster_nodes: &ClusterNodes<RetransmitStage>, pubkey| {
+            let index = cluster_nodes.index[pubkey];
+            cluster_nodes.nodes[index]
+                .contact_info()?
+                .tvu(Protocol::UDP)
+        };
+
+        let mut node = nodes[1].clone();
+        let pubkey = *node.pubkey();
+        let old_tvu_addr = node.tvu(Protocol::UDP);
+        let cluster_nodes = cache.get(0, &bank, &bank, &cluster_info);
+        assert_eq!(tvu_addr(&cluster_nodes, &pubkey), old_tvu_addr);
+
+        // The node moves right after the entry was built: the change waits for
+        // min_rebuild_interval.
+        let new_tvu_addr = SocketAddr::from(([10, 0, 0, 1], 8001));
+        node.set_wallclock(node.wallclock() + 1);
+        node.set_tvu(Protocol::UDP, new_tvu_addr).unwrap();
+        cluster_info.insert_info(node);
+        let entry = cache.get(0, &bank, &bank, &cluster_info);
+        assert!(Arc::ptr_eq(&cluster_nodes, &entry));
+
+        // Once the entry is old enough, the change discards it even though it
+        // has not expired yet.
+        cache.min_rebuild_interval = Duration::ZERO;
+        let cluster_nodes = cache.get(0, &bank, &bank, &cluster_info);
+        assert_eq!(tvu_addr(&cluster_nodes, &pubkey), Some(new_tvu_addr));
+        // Without further changes, the new entry is reused.
+        let entry = cache.get(0, &bank, &bank, &cluster_info);
+        assert!(Arc::ptr_eq(&cluster_nodes, &entry));
     }
 
     #[test]

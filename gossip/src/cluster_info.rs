@@ -88,7 +88,7 @@ use {
         result::Result,
         sync::{
             Arc, Mutex, OnceLock,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         thread::{Builder, JoinHandle, sleep},
         time::{Duration, Instant},
@@ -213,6 +213,8 @@ pub struct ClusterInfo {
     sigverify_cache: SigVerifyCache,
     /// Alpenglow migration status
     migration_status: OnceLock<Arc<MigrationStatus>>,
+    /// Shared with the crds table; see `num_tvu_addr_changes`.
+    num_tvu_addr_changes: Arc<AtomicU64>,
 }
 
 impl ClusterInfo {
@@ -222,8 +224,10 @@ impl ClusterInfo {
         socket_addr_space: SocketAddrSpace,
     ) -> Self {
         assert_eq!(contact_info.pubkey(), &keypair.pubkey());
+        let gossip = CrdsGossip::default();
+        let num_tvu_addr_changes = gossip.crds.read().num_tvu_addr_changes().clone();
         let me = Self {
-            gossip: CrdsGossip::default(),
+            gossip,
             keypair: ArcSwap::from(keypair),
             entrypoints: RwLock::default(),
             known_validators: OnceLock::new(),
@@ -252,9 +256,16 @@ impl ClusterInfo {
             bind_ip_addrs: Arc::new(BindIpAddrs::default()),
             sigverify_cache: SigVerifyCache::new(),
             migration_status: OnceLock::new(),
+            num_tvu_addr_changes,
         };
         me.refresh_my_gossip_contact_info();
         me
+    }
+
+    /// Returns how many times a node's contact-info in gossip was replaced
+    /// with one having a different TVU address. Does not take the crds lock.
+    pub fn num_tvu_addr_changes(&self) -> u64 {
+        self.num_tvu_addr_changes.load(Ordering::Relaxed)
     }
 
     /// Wires in the Alpenglow MigrationStatus.
