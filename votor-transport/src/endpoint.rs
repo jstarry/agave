@@ -722,6 +722,12 @@ mod tests {
             HIGH_PPS,
         );
         let server_pk = server.pubkey();
+        // Keep `handshake_rejected_unauthorized` cumulative across report ticks.
+        server
+            .endpoint
+            .server_stats
+            .report_frozen
+            .store(true, Ordering::Relaxed);
         let client_a = Node::spawn_node(
             &rt,
             keypair_a,
