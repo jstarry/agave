@@ -118,7 +118,8 @@ impl BigTableUploadService {
 /// `None` if there is nothing new to upload yet.
 ///
 /// The pass never extends past `blockstore.max_root()`, because
-/// `upload_confirmed_blocks` treats a range with no rooted slots as done.
+/// `upload_confirmed_blocks` treats a range with no rooted slots as done. The
+/// returned slot is inclusive, so a pass may be the single slot `start_slot`.
 fn next_upload_end_slot(
     start_slot: Slot,
     max_complete_transaction_status_slot: &AtomicU64,
@@ -133,7 +134,7 @@ fn next_upload_end_slot(
         highest_complete_root,
         start_slot.saturating_add(config.max_num_slots_to_check as u64 * 2),
     );
-    (end_slot > start_slot).then_some(end_slot)
+    (end_slot >= start_slot).then_some(end_slot)
 }
 
 #[cfg(test)]
@@ -178,7 +179,7 @@ mod tests {
             ),
             Some(150),
         );
-        // ...but not when it starts at the root; that waits for the next root.
+        // ...and a pass starting at it covers just that root.
         assert_eq!(
             next_upload_end_slot(
                 150,
@@ -186,7 +187,7 @@ mod tests {
                 &blockstore,
                 &config
             ),
-            None,
+            Some(150),
         );
 
         // Once the marker is written, the pass from 151 includes 156.
@@ -199,6 +200,38 @@ mod tests {
                 &config,
             ),
             Some(156),
+        );
+    }
+
+    #[test]
+    fn test_stalled_root_is_uploaded() {
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
+        let config = ConfirmedBlockUploadConfig::default();
+
+        // Everything before root 150 is uploaded, and the root stops moving.
+        blockstore.set_roots([0, 150].iter()).unwrap();
+        let max_complete_transaction_status_slot = AtomicU64::new(150);
+
+        // The next pass uploads block 150 without waiting for another root...
+        assert_eq!(
+            next_upload_end_slot(
+                150,
+                &max_complete_transaction_status_slot,
+                &blockstore,
+                &config,
+            ),
+            Some(150),
+        );
+        // ...and once it is uploaded, there is nothing left to do.
+        assert_eq!(
+            next_upload_end_slot(
+                151,
+                &max_complete_transaction_status_slot,
+                &blockstore,
+                &config,
+            ),
+            None,
         );
     }
 }
