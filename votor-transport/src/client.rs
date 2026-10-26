@@ -39,7 +39,11 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub(crate) enum PeerState {
     /// Handshake in progress.
-    Connecting,
+    Connecting {
+        // If the peer moves before the handshake resolves, reconcile dials the
+        // new address and this handshake's outcome is discarded.
+        target_address: SocketAddr,
+    },
     /// Live send-only connection.
     Established {
         connection: Connection,
@@ -49,9 +53,9 @@ pub(crate) enum PeerState {
     },
 }
 
-/// `Ok` carries the peer and its newly established connection; `Err` carries
-/// the peer we tried (and failed) to connect to.
-type HandshakeOutcome = Result<(Pubkey, Connection), Pubkey>;
+/// `Ok` carries the peer, the address dialed and the newly established
+/// connection; `Err` carries the peer and address we failed to connect to.
+type HandshakeOutcome = Result<(Pubkey, SocketAddr, Connection), (Pubkey, SocketAddr)>;
 
 /// Enforce the send-only contract of an outbound connection.
 async fn reject_reverse_datagrams(peer: Pubkey, connection: Connection) {
@@ -79,16 +83,16 @@ async fn connect(
         Ok(connection)
     };
     match timeout(HANDSHAKE_TIMEOUT, attempt).await {
-        Ok(Ok(connection)) => Ok((peer, connection)),
+        Ok(Ok(connection)) => Ok((peer, addr, connection)),
         Ok(Err(e)) => {
             warn!("Connection attempt to ({peer}, {addr}) failed: {e:?}");
             record_client_error(&e, &stats);
-            Err(peer)
+            Err((peer, addr))
         }
         Err(_elapsed) => {
             warn!("Connection attempt to ({peer}, {addr}) timed out after {HANDSHAKE_TIMEOUT:?}");
             stats.connect_failed.fetch_add(1, Ordering::Relaxed);
-            Err(peer)
+            Err((peer, addr))
         }
     }
 }
@@ -269,7 +273,7 @@ impl OutboundLoop {
                 // A Connecting entry resolves within HANDSHAKE_TIMEOUT through
                 // `handle_handshake_outcome` into an Established (at which point we can wipe it)
                 // or just gets removed there.
-                PeerState::Connecting => true,
+                PeerState::Connecting { .. } => true,
             }
         });
         self.stats
@@ -293,8 +297,10 @@ impl OutboundLoop {
                 continue;
             };
             let needs_connection = match self.peer_state.get(peer) {
-                // A handshake is already in flight; do not spawn a second task for this peer.
-                Some(PeerState::Connecting) => false,
+                // A handshake is already in flight; do not spawn a second task for this
+                // peer unless it has moved. The handshake to the old address can take
+                // up to HANDSHAKE_TIMEOUT if the old host is gone, so do not wait for it.
+                Some(PeerState::Connecting { target_address }) => target_address != addr,
                 Some(PeerState::Established {
                     connection,
                     target_address: cur,
@@ -331,7 +337,12 @@ impl OutboundLoop {
                     *addr,
                     self.stats.clone(),
                 ));
-                self.peer_state.insert(*peer, PeerState::Connecting);
+                self.peer_state.insert(
+                    *peer,
+                    PeerState::Connecting {
+                        target_address: *addr,
+                    },
+                );
             }
         }
     }
@@ -375,34 +386,39 @@ impl OutboundLoop {
 
     /// Handle a handshake task that ran to completion.
     fn handle_handshake_outcome(&mut self, outcome: HandshakeOutcome) {
-        // Peer state is always `Connecting` here: one handshake per peer, reconcile
-        // leaves `Connecting` entries in place, and identity rotation resets the JoinSet.
+        // Peer state is `Connecting` here: reconcile leaves `Connecting` entries in place
+        // and identity rotation resets the JoinSet. Only a handshake superseded by one to
+        // the peer's new address finds the peer elsewhere; discard its outcome.
+        let (peer, addr) = match &outcome {
+            Ok((peer, addr, _)) | Err((peer, addr)) => (*peer, *addr),
+        };
+        if !matches!(
+            self.peer_state.get(&peer),
+            Some(PeerState::Connecting { target_address }) if *target_address == addr
+        ) {
+            debug!("OutboundLoop: discarding superseded handshake to ({peer}, {addr}).");
+            if let Ok((_, _, connection)) = outcome {
+                close_codes::PEER_MOVED.close(&connection);
+            }
+            return;
+        }
         match outcome {
-            Ok((peer, connection)) => {
-                let target_address = connection.remote_address();
+            Ok((peer, target_address, connection)) => {
                 let reverse_datagram_reader = connection.clone();
-                let previous = self.peer_state.insert(
+                self.peer_state.insert(
                     peer,
                     PeerState::Established {
                         connection,
                         target_address,
                     },
                 );
-                debug_assert!(
-                    matches!(previous, Some(PeerState::Connecting)),
-                    "handshake success for {peer} whose state was {previous:?}, not Connecting."
-                );
                 self.reverse_datagram_readers
                     .spawn(reject_reverse_datagrams(peer, reverse_datagram_reader));
                 info!("OutboundLoop: established connection to {peer}.");
                 stats::record_connection_count(&self.stats.peak_connections, self.total_peers());
             }
-            Err(peer) => {
-                let removed = self.peer_state.remove(&peer);
-                debug_assert!(
-                    matches!(removed, Some(PeerState::Connecting)),
-                    "handshake failed for {peer} whose state was {removed:?}, not Connecting."
-                );
+            Err((peer, _)) => {
+                self.peer_state.remove(&peer);
                 // an operator-visible message is printed in handshake task itself
             }
         }
@@ -453,9 +469,12 @@ mod tests {
 
         // Add a fake peer whose handshake is not finished at the moment of id change.
         let stuck_peer = Keypair::new().pubkey();
-        outbound
-            .peer_state
-            .insert(stuck_peer, PeerState::Connecting);
+        outbound.peer_state.insert(
+            stuck_peer,
+            PeerState::Connecting {
+                target_address: SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
+            },
+        );
         outbound.in_flight_handshakes.spawn(async {
             sleep(Duration::from_secs(10)).await;
             unreachable!("This future should never resolve");
@@ -492,6 +511,101 @@ mod tests {
             outbound.local_pubkey, new_pubkey,
             "identity change must adopt the new pubkey",
         );
+    }
+
+    /// A peer that moves while a handshake to its old address hangs is dialed at
+    /// the new address right away, and the old handshake's outcome is discarded.
+    #[tokio::test]
+    async fn moved_peer_supersedes_in_flight_handshake() {
+        use crate::transport::new_server_config;
+
+        const MAX_DATAGRAMS_PER_SECOND: usize = 50;
+        let mut ports = unique_port_range_for_tests(2);
+
+        let peer_keypair = Keypair::new();
+        let peer = peer_keypair.pubkey();
+        let server = Endpoint::server(
+            new_server_config(&peer_keypair, MAX_DATAGRAMS_PER_SECOND, 1),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, ports.next().unwrap())),
+        )
+        .expect("bind server endpoint");
+        let new_addr = server.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            let connection = server.accept().await.unwrap().await.unwrap();
+            connection.closed().await
+        });
+
+        let client_keypair = Keypair::new();
+        let mut endpoint = Endpoint::client(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            ports.next().unwrap(),
+        )))
+        .expect("bind client endpoint");
+        endpoint.set_default_client_config(new_client_config(
+            &client_keypair,
+            MAX_DATAGRAMS_PER_SECOND,
+        ));
+        let (_egress_tx, egress_rx) = mpsc::channel(1);
+        let (_identity_tx, identity_rx) = watch::channel(Keypair::new());
+        let (ack, _acks) = crossbeam_channel::unbounded();
+        let (peer_list_tx, peer_list_rx) = watch::channel(Arc::new(PeerList {
+            peers: HashMap::default(),
+            push_enabled: true,
+        }));
+        let mut outbound = OutboundLoop::new(
+            endpoint,
+            client_keypair.pubkey(),
+            egress_rx,
+            KeyUpdateListener {
+                receiver: identity_rx,
+                ack,
+            },
+            peer_list_rx,
+            CancellationToken::new(),
+            MAX_DATAGRAMS_PER_SECOND,
+        );
+
+        // A handshake to the peer's old address hangs, as if the old host were gone.
+        let old_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1));
+        outbound.peer_state.insert(
+            peer,
+            PeerState::Connecting {
+                target_address: old_addr,
+            },
+        );
+        outbound.in_flight_handshakes.spawn(async {
+            sleep(Duration::from_secs(10)).await;
+            unreachable!("This future should never resolve");
+        });
+
+        // The peer moves.
+        peer_list_tx.send_replace(Arc::new(PeerList {
+            peers: HashMap::from([(peer, Some(new_addr))]),
+            push_enabled: true,
+        }));
+        outbound.reconcile();
+        assert!(matches!(
+            outbound.peer_state.get(&peer),
+            Some(PeerState::Connecting { target_address }) if *target_address == new_addr
+        ));
+
+        // The old handshake failing does not affect the new one.
+        outbound.handle_handshake_outcome(Err((peer, old_addr)));
+        assert!(matches!(
+            outbound.peer_state.get(&peer),
+            Some(PeerState::Connecting { target_address }) if *target_address == new_addr
+        ));
+
+        let outcome = timeout(HANDSHAKE_TIMEOUT, outbound.in_flight_handshakes.join_next())
+            .await
+            .expect("handshake to the new address did not complete")
+            .unwrap()
+            .unwrap();
+        outbound.handle_handshake_outcome(outcome);
+        assert!(matches!(
+            outbound.peer_state.get(&peer),
+            Some(PeerState::Established { target_address, .. }) if *target_address == new_addr
+        ));
     }
 
     #[tokio::test]
