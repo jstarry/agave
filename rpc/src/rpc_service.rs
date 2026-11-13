@@ -47,6 +47,7 @@ use {
     solana_tls_utils::NotifyKeyUpdate,
     solana_validator_exit::Exit,
     std::{
+        io::SeekFrom,
         net::{SocketAddr, UdpSocket},
         path::{Path, PathBuf},
         pin::Pin,
@@ -58,7 +59,10 @@ use {
         thread::{self, Builder, JoinHandle},
         time::Duration,
     },
-    tokio::runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
+    tokio::{
+        io::{AsyncReadExt, AsyncSeekExt},
+        runtime::{Builder as TokioBuilder, Handle as RuntimeHandle, Runtime as TokioRuntime},
+    },
     tokio_util::{
         bytes::Bytes,
         codec::{BytesCodec, FramedRead},
@@ -80,6 +84,68 @@ const FALLBACK_INCREMENTAL_SNAPSHOT_TIMEOUT_SECS: Duration = Duration::from_secs
 enum SnapshotKind {
     Full,
     Incremental,
+}
+
+/// The part of a file to send in response to a request
+#[derive(Debug, PartialEq, Eq)]
+enum RequestedRange {
+    /// The whole file, with a 200
+    Whole,
+    /// Bytes `start..=end` of the file, with a 206
+    Part { start: u64, end: u64 },
+    /// No byte of the file, with a 416
+    Unsatisfiable,
+}
+
+impl RequestedRange {
+    /// Returns the part of a file of `file_length` bytes that a `Range`
+    /// header asks for.
+    ///
+    /// Only a single `bytes` range is served. A multipart or malformed range
+    /// is ignored, which RFC 9110 allows, and the whole file is sent.
+    fn new(range: &hyper::header::HeaderValue, file_length: u64) -> Self {
+        let parse = |value: &str| {
+            if value.bytes().all(|b| b.is_ascii_digit()) {
+                value.parse::<u64>().ok()
+            } else {
+                None
+            }
+        };
+        let Some((first, last)) = range
+            .to_str()
+            .ok()
+            .and_then(|range| range.strip_prefix("bytes="))
+            .filter(|range| !range.contains(','))
+            .and_then(|range| range.trim().split_once('-'))
+        else {
+            return Self::Whole;
+        };
+        let (start, end) = if first.is_empty() {
+            // The last `last` bytes
+            match parse(last) {
+                Some(0) => return Self::Unsatisfiable,
+                Some(suffix) => (file_length.saturating_sub(suffix), u64::MAX),
+                None => return Self::Whole,
+            }
+        } else {
+            match (parse(first), last) {
+                (Some(start), "") => (start, u64::MAX),
+                (Some(start), last) => match parse(last) {
+                    Some(end) if start <= end => (start, end),
+                    _ => return Self::Whole,
+                },
+                (None, _) => return Self::Whole,
+            }
+        };
+        if start >= file_length {
+            Self::Unsatisfiable
+        } else {
+            Self::Part {
+                start,
+                end: end.min(file_length - 1),
+            }
+        }
+    }
 }
 
 struct SnapshotStream {
@@ -271,9 +337,9 @@ impl RpcRequestMiddleware {
         )
     }
 
-    fn process_file_get(&self, path: &str) -> RequestMiddlewareAction {
+    fn process_file_get(&self, path: &str, headers: &hyper::HeaderMap) -> RequestMiddlewareAction {
+        let stem = Self::strip_leading_slash(path).expect("path already verified");
         let (filename, snapshot_type) = {
-            let stem = Self::strip_leading_slash(path).expect("path already verified");
             match path {
                 DEFAULT_GENESIS_DOWNLOAD_PATH => {
                     inc_new_counter_info!("rpc-get_genesis", 1);
@@ -286,11 +352,25 @@ impl RpcRequestMiddleware {
                 }
             }
         };
-        let file_length = std::fs::metadata(&filename)
-            .map(|m| m.len())
-            .unwrap_or(0)
-            .to_string();
+        let file_length = std::fs::metadata(&filename).map(|m| m.len()).unwrap_or(0);
         info!("get {path} -> {filename:?} ({file_length} bytes)");
+
+        // A file's name and length identify its contents: genesis never changes, and a
+        // snapshot archive's name carries its slot and hash.
+        let etag = hyper::header::HeaderValue::from_str(&format!("\"{stem}-{file_length}\""))
+            .expect("path already verified");
+        // Ranges of another version of the file must not be mixed with this one, so a range
+        // is only served when `If-Range`, if sent, names this version.
+        let range = headers
+            .get(hyper::header::RANGE)
+            .filter(|_| {
+                headers
+                    .get(hyper::header::IF_RANGE)
+                    .is_none_or(|if_range| *if_range == etag)
+            })
+            .map_or(RequestedRange::Whole, |range| {
+                RequestedRange::new(range, file_length)
+            });
 
         if cfg!(not(test)) {
             assert!(
@@ -335,16 +415,43 @@ impl RpcRequestMiddleware {
                     } else {
                         Self::internal_server_error()
                     }),
-                    Ok(file) => {
-                        let stream =
-                            FramedRead::new(file, BytesCodec::new()).map_ok(|b| b.freeze());
+                    Ok(mut file) => {
+                        let response = hyper::Response::builder()
+                            .header(hyper::header::ACCEPT_RANGES, "bytes")
+                            .header(hyper::header::ETAG, etag);
+                        let (response, start, length) = match range {
+                            RequestedRange::Whole => (response, 0, file_length),
+                            RequestedRange::Part { start, end } => (
+                                response.status(hyper::StatusCode::PARTIAL_CONTENT).header(
+                                    hyper::header::CONTENT_RANGE,
+                                    format!("bytes {start}-{end}/{file_length}"),
+                                ),
+                                start,
+                                end - start + 1,
+                            ),
+                            RequestedRange::Unsatisfiable => {
+                                return Ok(response
+                                    .status(hyper::StatusCode::RANGE_NOT_SATISFIABLE)
+                                    .header(
+                                        hyper::header::CONTENT_RANGE,
+                                        format!("bytes */{file_length}"),
+                                    )
+                                    .body(hyper::Body::empty())
+                                    .unwrap());
+                            }
+                        };
+                        if file.seek(SeekFrom::Start(start)).await.is_err() {
+                            return Ok(Self::internal_server_error());
+                        }
+                        let stream = FramedRead::new(file.take(length), BytesCodec::new())
+                            .map_ok(|b| b.freeze());
                         let body = if let Some(timeout) = snapshot_timeout {
                             hyper::Body::wrap_stream(SnapshotStream::new(stream, timeout))
                         } else {
                             hyper::Body::wrap_stream(stream)
                         };
-                        Ok(hyper::Response::builder()
-                            .header(hyper::header::CONTENT_LENGTH, file_length)
+                        Ok(response
+                            .header(hyper::header::CONTENT_LENGTH, length)
                             .body(body)
                             .unwrap())
                     }
@@ -413,7 +520,7 @@ impl RequestMiddleware for RpcRequestMiddleware {
         if let Some(path) = match_supply_path(request.uri().path()) {
             process_rest(self.bank_forks.clone(), path)
         } else if self.is_file_get_path(request.uri().path()) {
-            self.process_file_get(request.uri().path())
+            self.process_file_get(request.uri().path(), request.headers())
         } else if request.uri().path() == "/health" {
             hyper::Response::builder()
                 .status(hyper::StatusCode::OK)
@@ -1444,7 +1551,7 @@ mod tests {
         );
 
         // File does not exist => request should fail.
-        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, &hyper::HeaderMap::new());
         if let RequestMiddlewareAction::Respond { response, .. } = action {
             let response = runtime.block_on(response);
             let response = response.unwrap();
@@ -1459,7 +1566,7 @@ mod tests {
         }
 
         // Normal file exist => request should succeed.
-        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, &hyper::HeaderMap::new());
         if let RequestMiddlewareAction::Respond { response, .. } = action {
             let response = runtime.block_on(response);
             let response = response.unwrap();
@@ -1482,7 +1589,7 @@ mod tests {
         agave_fs::symlink("wrong", &genesis_path).unwrap();
 
         // File is a symbolic link => request should fail.
-        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH, &hyper::HeaderMap::new());
         if let RequestMiddlewareAction::Respond { response, .. } = action {
             let response = runtime.block_on(response);
             let response = response.unwrap();
@@ -1502,7 +1609,7 @@ mod tests {
         ] {
             let contents = b"snapshot contents";
             std::fs::write(ledger_path.path().join(&path[1..]), contents).unwrap();
-            let action = rrm.process_file_get(path);
+            let action = rrm.process_file_get(path, &hyper::HeaderMap::new());
             assert!(matches!(action, RequestMiddlewareAction::Respond { .. }));
             if let RequestMiddlewareAction::Respond { response, .. } = action {
                 runtime.block_on(async {
@@ -1518,6 +1625,139 @@ mod tests {
                     );
                 });
             }
+        }
+    }
+
+    #[test]
+    fn test_requested_range() {
+        let range = |range: &str| {
+            RequestedRange::new(&hyper::header::HeaderValue::from_str(range).unwrap(), 10)
+        };
+        let part = |start, end| RequestedRange::Part { start, end };
+        assert_eq!(range("bytes=0-9"), part(0, 9));
+        assert_eq!(range("bytes=2-5"), part(2, 5));
+        assert_eq!(range("bytes=5-5"), part(5, 5));
+        assert_eq!(range("bytes=7-"), part(7, 9));
+        assert_eq!(range("bytes=7-100"), part(7, 9));
+        assert_eq!(range("bytes=-3"), part(7, 9));
+        assert_eq!(range("bytes=-100"), part(0, 9));
+        assert_eq!(range("bytes=10-"), RequestedRange::Unsatisfiable);
+        assert_eq!(range("bytes=10-20"), RequestedRange::Unsatisfiable);
+        assert_eq!(range("bytes=-0"), RequestedRange::Unsatisfiable);
+        for ignored in [
+            "bytes=5-2",
+            "bytes=0-1,4-5",
+            "bytes=-",
+            "bytes=a-b",
+            "bytes=+1-2",
+            "bytes=1-2-3",
+            "bytes=18446744073709551616-",
+            "items=0-1",
+            "0-1",
+        ] {
+            assert_eq!(range(ignored), RequestedRange::Whole, "{ignored}");
+        }
+        assert_eq!(
+            RequestedRange::new(&hyper::header::HeaderValue::from_static("bytes=0-"), 0),
+            RequestedRange::Unsatisfiable
+        );
+    }
+
+    #[test]
+    fn test_process_file_get_range() {
+        let runtime = Runtime::new().unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let bank_forks = create_bank_forks();
+        let optimistically_confirmed_bank =
+            OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
+        let rrm = RpcRequestMiddleware::new(
+            ledger_path.path().to_path_buf(),
+            Some(SnapshotConfig {
+                full_snapshot_archives_dir: ledger_path.path().to_path_buf(),
+                incremental_snapshot_archives_dir: ledger_path.path().to_path_buf(),
+                ..SnapshotConfig::default()
+            }),
+            bank_forks,
+            RpcHealth::stub(optimistically_confirmed_bank),
+        );
+        let name = "snapshot-100-AvFf9oS8A8U78HdjT9YG2sTTThLHJZmhaMn2g8vkWYnr.tar.zst";
+        let path = format!("/{name}");
+        let get = |headers: &[(hyper::header::HeaderName, &str)]| {
+            let headers = headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.parse().unwrap()))
+                .collect();
+            let RequestMiddlewareAction::Respond { response, .. } =
+                rrm.process_file_get(&path, &headers)
+            else {
+                panic!("Unexpected RequestMiddlewareAction variant");
+            };
+            runtime.block_on(async {
+                let response = response.await.unwrap();
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+                (status, headers, body)
+            })
+        };
+        let range = hyper::header::RANGE;
+        let if_range = hyper::header::IF_RANGE;
+
+        // A range of a missing file
+        let (status, ..) = get(&[(range.clone(), "bytes=0-1")]);
+        assert_eq!(status, hyper::StatusCode::NOT_FOUND);
+
+        std::fs::write(ledger_path.path().join(name), b"0123456789").unwrap();
+        let etag = format!("\"{name}-10\"");
+
+        // The whole file
+        let (status, headers, body) = get(&[]);
+        assert_eq!(status, hyper::StatusCode::OK);
+        assert_eq!(headers[hyper::header::ACCEPT_RANGES], "bytes");
+        assert_eq!(headers[hyper::header::ETAG], etag);
+        assert_eq!(headers[hyper::header::CONTENT_LENGTH], "10");
+        assert!(!headers.contains_key(hyper::header::CONTENT_RANGE));
+        assert_eq!(body, "0123456789");
+
+        // A range, with or without a matching `If-Range`
+        for headers in [
+            vec![(range.clone(), "bytes=2-5")],
+            vec![(range.clone(), "bytes=2-5"), (if_range.clone(), &etag)],
+        ] {
+            let (status, headers, body) = get(&headers);
+            assert_eq!(status, hyper::StatusCode::PARTIAL_CONTENT);
+            assert_eq!(headers[hyper::header::CONTENT_RANGE], "bytes 2-5/10");
+            assert_eq!(headers[hyper::header::CONTENT_LENGTH], "4");
+            assert_eq!(headers[hyper::header::ETAG], etag);
+            assert_eq!(body, "2345");
+        }
+        let (status, headers, body) = get(&[(range.clone(), "bytes=7-")]);
+        assert_eq!(status, hyper::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers[hyper::header::CONTENT_RANGE], "bytes 7-9/10");
+        assert_eq!(body, "789");
+
+        // A range past the end of the file
+        let (status, headers, body) = get(&[(range.clone(), "bytes=10-")]);
+        assert_eq!(status, hyper::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(headers[hyper::header::CONTENT_RANGE], "bytes */10");
+        assert!(body.is_empty());
+
+        // An ignored range, or a range of another version of the file
+        for headers in [
+            vec![(range.clone(), "bytes=0-1,4-5")],
+            vec![
+                (range.clone(), "bytes=2-5"),
+                (if_range.clone(), "\"other\""),
+            ],
+            vec![
+                (range.clone(), "bytes=2-5"),
+                (if_range.clone(), "Wed, 21 Oct 2015 07:28:00 GMT"),
+            ],
+        ] {
+            let (status, headers, body) = get(&headers);
+            assert_eq!(status, hyper::StatusCode::OK);
+            assert_eq!(headers[hyper::header::CONTENT_LENGTH], "10");
+            assert_eq!(body, "0123456789");
         }
     }
 }
